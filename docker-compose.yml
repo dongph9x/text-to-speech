@@ -1,10 +1,10 @@
 version: "3.9"
 
 services:
-  discord-tts-bot:
+  discord-tts-bot-addams:
     build: .
-    image: discord-tts-bot:latest
-    container_name: discord-tts-bot
+    image: discord-tts-bot-addams:latest
+    container_name: discord-tts-bot-addams
     restart: unless-stopped
     env_file: .env
     # Mount configs so GOOGLE_APPLICATION_CREDENTIALS path works and roles file persists

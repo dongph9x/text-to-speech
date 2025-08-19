@@ -245,14 +245,35 @@ async function ensureConnectionAndPlayer(voiceChannel) {
   const guildId = voiceChannel.guild.id;
   let connection = guildIdToConnection.get(guildId);
   if (!connection || connection.state.status === VoiceConnectionStatus.Destroyed) {
+    // Pre-check permissions/capacity before trying to connect
+    const me = voiceChannel.guild.members?.me;
+    const perms = voiceChannel.permissionsFor?.(me);
+    const missing = [];
+    if (!perms?.has(PermissionsBitField.Flags.ViewChannel)) missing.push('ViewChannel');
+    if (!perms?.has(PermissionsBitField.Flags.Connect)) missing.push('Connect');
+    if (!perms?.has(PermissionsBitField.Flags.Speak)) missing.push('Speak');
+    const isFull = typeof voiceChannel.userLimit === 'number' && voiceChannel.userLimit > 0 && voiceChannel.members?.size >= voiceChannel.userLimit;
+    if (missing.length) {
+      throw new Error(`Bot thiếu quyền: ${missing.join(', ')} trong kênh thoại.`);
+    }
+    if (isFull) {
+      throw new Error('Kênh thoại đã đầy, không thể tham gia.');
+    }
+
     connection = joinVoiceChannel({
       channelId: voiceChannel.id,
       guildId: guildId,
       adapterCreator: voiceChannel.guild.voiceAdapterCreator,
-      selfDeaf: false,
+      selfDeaf: true,
     });
     guildIdToConnection.set(guildId, connection);
-    await entersState(connection, VoiceConnectionStatus.Ready, 15_000);
+    try {
+      await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
+    } catch (e) {
+      try { connection.destroy(); } catch {}
+      guildIdToConnection.delete(guildId);
+      throw new Error('Không thể kết nối tới voice channel (timeout). Vui lòng kiểm tra quyền Connect/Speak của bot, trạng thái server/kênh, và thử lại.');
+    }
   }
 
   let player = guildIdToPlayer.get(guildId);
@@ -382,6 +403,12 @@ async function ackSilent(interaction, text = 'Đang xử lý...') {
   try {
     const content = SILENT_MODE === 'ack' ? ACK_TEXT : text;
     await interaction.reply({ content, flags: MessageFlags.Ephemeral });
+    // Tự động xóa sau CLEAR_DELAY_MS nếu ở chế độ delete
+    if (SILENT_MODE === 'delete') {
+      setTimeout(() => {
+        interaction.deleteReply().catch(() => {});
+      }, CLEAR_DELAY_MS);
+    }
   } catch (_) {
     // Bỏ qua mọi lỗi để không log gây nhiễu
     return { async clear() {} };
@@ -391,11 +418,7 @@ async function ackSilent(interaction, text = 'Đang xử lý...') {
     async clear() {
       if (cleared) return;
       cleared = true;
-      if (SILENT_MODE === 'delete') {
-        // Chờ để client xử lý acknowledge, tránh hiển thị lỗi "This interaction failed"
-        await new Promise((r) => setTimeout(r, CLEAR_DELAY_MS));
-        await interaction.deleteReply().catch(() => {});
-      }
+      // Ở chế độ delete, việc xóa đã được hẹn giờ ở trên để tự động dismiss
     },
   };
 }
@@ -515,26 +538,36 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const connection = guildIdToConnection.get(guildId);
       const player = guildIdToPlayer.get(guildId);
       if (connection) {
+        // Try to say farewell but do not block leaving indefinitely
         try {
-          // Phát lời chào tạm biệt trước khi thoát
           const channelId = connection.joinConfig?.channelId;
-          const vc = interaction.guild?.channels?.cache?.get(channelId);
+          let vc = interaction.guild?.channels?.cache?.get(channelId);
+          if (!vc && interaction.guild?.channels?.fetch) {
+            try { vc = await interaction.guild.channels.fetch(channelId); } catch {}
+          }
           if (vc && typeof vc.joinable !== 'undefined') {
             const bye = buildFarewellText(interaction);
-            await speakTextInChannel(vc, bye, FAREWELL_LANG, {
+            const speakPromise = speakTextInChannel(vc, bye, FAREWELL_LANG, {
               rate: FAREWELL_RATE,
               pitch: FAREWELL_PITCH,
               voice: FAREWELL_VOICE,
               gender: FAREWELL_GENDER,
             });
+            // Bound by timeout to avoid hanging if audio cannot be played
+            const timeoutMs = 10_000;
+            await Promise.race([
+              speakPromise,
+              new Promise((resolve) => setTimeout(resolve, timeoutMs)),
+            ]);
           }
         } catch (e) {
           console.warn('farewell failed:', e?.message || e);
+        } finally {
+          try { player?.stop(true); } catch {}
+          try { connection.destroy(); } catch {}
+          guildIdToConnection.delete(guildId);
+          guildIdToPlayer.delete(guildId);
         }
-        try { player?.stop(true); } catch {}
-        try { connection.destroy(); } catch {}
-        guildIdToConnection.delete(guildId);
-        guildIdToPlayer.delete(guildId);
       }
       await ack.clear();
       return;
