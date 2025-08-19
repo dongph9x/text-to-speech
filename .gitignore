@@ -1,0 +1,22 @@
+# Dependencies
+node_modules/
+
+# Env files
+.env
+.env.*
+!.env.example
+
+# Credentials
+configs/*.json
+
+# Build artifacts
+/dist/
+/build/
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# macOS
+.DS_Store
