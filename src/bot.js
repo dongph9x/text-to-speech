@@ -49,6 +49,10 @@ const DEFAULT_TTS_RATE = Number.isFinite(Number(process.env.DEFAULT_TTS_RATE))
   ? Number(process.env.DEFAULT_TTS_RATE)
   : undefined;
 const SILENT_MODE = (process.env.SILENT_MODE || 'ack').toLowerCase(); // 'ack' | 'delete'
+const CLEAR_DELAY_MS = Number.isFinite(Number(process.env.CLEAR_DELAY_MS))
+  ? Number(process.env.CLEAR_DELAY_MS)
+  : 3500;
+const ACK_TEXT = typeof process.env.ACK_TEXT === 'string' ? process.env.ACK_TEXT : 'Đang xử lý...';
 
 if (!TOKEN || !CLIENT_ID) {
   console.error('Missing DISCORD_TOKEN or DISCORD_CLIENT_ID in .env');
@@ -344,7 +348,8 @@ async function ackSilent(interaction, text = 'Đang xử lý...') {
     return { async clear() {} };
   }
   try {
-    await interaction.reply({ content: text, flags: MessageFlags.Ephemeral });
+    const content = SILENT_MODE === 'ack' ? ACK_TEXT : text;
+    await interaction.reply({ content, flags: MessageFlags.Ephemeral });
   } catch (_) {
     // Bỏ qua mọi lỗi để không log gây nhiễu
     return { async clear() {} };
@@ -355,8 +360,8 @@ async function ackSilent(interaction, text = 'Đang xử lý...') {
       if (cleared) return;
       cleared = true;
       if (SILENT_MODE === 'delete') {
-        // Chờ ngắn để client xử lý acknowledge tránh hiển thị lỗi
-        await new Promise((r) => setTimeout(r, 1200));
+        // Chờ để client xử lý acknowledge, tránh hiển thị lỗi "This interaction failed"
+        await new Promise((r) => setTimeout(r, CLEAR_DELAY_MS));
         await interaction.deleteReply().catch(() => {});
       }
     },
@@ -484,7 +489,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
     const lang = interaction.options.getString('lang') || 'vi-VN';
     const rate = interaction.options.getNumber('rate');
     const pitch = interaction.options.getNumber('pitch');
-    const voice = interaction.options.getString('voice');
+    let voice = interaction.options.getString('voice');
+    if (voice && !isManager(interaction.member)) {
+      // Chỉ admin/quản lý mới được phép chọn voice cụ thể
+      voice = null;
+    }
     const gender = interaction.options.getString('gender');
     await speakTextInChannel(voiceChannel, text, lang, { rate, pitch, voice, gender });
     await ack.clear();
