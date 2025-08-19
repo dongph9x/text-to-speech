@@ -54,6 +54,38 @@ const CLEAR_DELAY_MS = Number.isFinite(Number(process.env.CLEAR_DELAY_MS))
   : 3500;
 const ACK_TEXT = typeof process.env.ACK_TEXT === 'string' ? process.env.ACK_TEXT : 'Đang xử lý...';
 
+// Greeting config for join
+const GREETING_TEXT = typeof process.env.GREETING_TEXT === 'string' && process.env.GREETING_TEXT.trim().length > 0
+  ? process.env.GREETING_TEXT
+  : 'Xin Chào Sir Ani Agent Có mặt';
+const GREETING_LANG = typeof process.env.GREETING_LANG === 'string' && process.env.GREETING_LANG.trim().length > 0
+  ? process.env.GREETING_LANG
+  : 'vi-VN';
+const GREETING_RATE = Number.isFinite(Number(process.env.GREETING_RATE)) ? Number(process.env.GREETING_RATE) : undefined;
+const GREETING_PITCH = Number.isFinite(Number(process.env.GREETING_PITCH)) ? Number(process.env.GREETING_PITCH) : undefined;
+const GREETING_VOICE = typeof process.env.GREETING_VOICE === 'string' && process.env.GREETING_VOICE.trim().length > 0
+  ? process.env.GREETING_VOICE
+  : undefined;
+const GREETING_GENDER = typeof process.env.GREETING_GENDER === 'string' && process.env.GREETING_GENDER.trim().length > 0
+  ? process.env.GREETING_GENDER
+  : undefined;
+
+// Farewell config for leave
+const FAREWELL_TEXT = typeof process.env.FAREWELL_TEXT === 'string' && process.env.FAREWELL_TEXT.trim().length > 0
+  ? process.env.FAREWELL_TEXT
+  : 'Tạm biệt {user}, hẹn gặp lại!';
+const FAREWELL_LANG = typeof process.env.FAREWELL_LANG === 'string' && process.env.FAREWELL_LANG.trim().length > 0
+  ? process.env.FAREWELL_LANG
+  : 'vi-VN';
+const FAREWELL_RATE = Number.isFinite(Number(process.env.FAREWELL_RATE)) ? Number(process.env.FAREWELL_RATE) : undefined;
+const FAREWELL_PITCH = Number.isFinite(Number(process.env.FAREWELL_PITCH)) ? Number(process.env.FAREWELL_PITCH) : undefined;
+const FAREWELL_VOICE = typeof process.env.FAREWELL_VOICE === 'string' && process.env.FAREWELL_VOICE.trim().length > 0
+  ? process.env.FAREWELL_VOICE
+  : undefined;
+const FAREWELL_GENDER = typeof process.env.FAREWELL_GENDER === 'string' && process.env.FAREWELL_GENDER.trim().length > 0
+  ? process.env.FAREWELL_GENDER
+  : undefined;
+
 if (!TOKEN || !CLIENT_ID) {
   console.error('Missing DISCORD_TOKEN or DISCORD_CLIENT_ID in .env');
   process.exit(1);
@@ -368,6 +400,22 @@ async function ackSilent(interaction, text = 'Đang xử lý...') {
   };
 }
 
+function buildGreetingText(interaction) {
+  const displayName = interaction?.member?.displayName || interaction?.user?.username || '';
+  const serverName = interaction?.guild?.name || '';
+  return (GREETING_TEXT || 'Xin chào!')
+    .replace(/\{user\}/g, displayName)
+    .replace(/\{server\}/g, serverName);
+}
+
+function buildFarewellText(interaction) {
+  const displayName = interaction?.member?.displayName || interaction?.user?.username || '';
+  const serverName = interaction?.guild?.name || '';
+  return (FAREWELL_TEXT || 'Tạm biệt!')
+    .replace(/\{user\}/g, displayName)
+    .replace(/\{server\}/g, serverName);
+}
+
 async function speakTextInChannel(voiceChannel, text, lang = 'vi-VN', opts = {}) {
   const { player } = await ensureConnectionAndPlayer(voiceChannel);
 
@@ -426,7 +474,23 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (interaction.commandName === 'join') {
       const ack = await ackSilent(interaction, 'Đang vào kênh...');
       if (voiceChannel) {
+        const displayName = interaction?.member?.displayName || interaction?.user?.username || interaction?.user?.id;
+        console.log(
+          `[JOIN_CMD] user="${displayName}" userId=${interaction.user?.id} guild="${interaction.guild?.name}" guildId=${interaction.guildId} channel="${voiceChannel.name}" time=${new Date().toISOString()}`
+        );
         await ensureConnectionAndPlayer(voiceChannel);
+        // Play greeting after join
+        try {
+          const greet = buildGreetingText(interaction);
+          await speakTextInChannel(voiceChannel, greet, GREETING_LANG, {
+            rate: GREETING_RATE,
+            pitch: GREETING_PITCH,
+            voice: GREETING_VOICE,
+            gender: GREETING_GENDER,
+          });
+        } catch (e) {
+          console.warn('greeting failed:', e?.message || e);
+        }
       }
       await ack.clear();
       return;
@@ -438,6 +502,22 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const connection = guildIdToConnection.get(guildId);
       const player = guildIdToPlayer.get(guildId);
       if (connection) {
+        try {
+          // Phát lời chào tạm biệt trước khi thoát
+          const channelId = connection.joinConfig?.channelId;
+          const vc = interaction.guild?.channels?.cache?.get(channelId);
+          if (vc && typeof vc.joinable !== 'undefined') {
+            const bye = buildFarewellText(interaction);
+            await speakTextInChannel(vc, bye, FAREWELL_LANG, {
+              rate: FAREWELL_RATE,
+              pitch: FAREWELL_PITCH,
+              voice: FAREWELL_VOICE,
+              gender: FAREWELL_GENDER,
+            });
+          }
+        } catch (e) {
+          console.warn('farewell failed:', e?.message || e);
+        }
         try { player?.stop(true); } catch {}
         try { connection.destroy(); } catch {}
         guildIdToConnection.delete(guildId);
@@ -448,10 +528,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 
     if (interaction.commandName === 'tts-roles') {
-      if (!isManager(interaction.member)) {
-        await interaction.reply({ content: 'Bạn cần quyền Quản lý server để dùng lệnh này.', flags: MessageFlags.Ephemeral }).catch(() => {});
-        return;
-      }
       const sub = interaction.options.getSubcommand();
       const current = await loadAllowedRoleIds();
       if (sub === 'list') {
@@ -460,6 +536,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
         } else {
           await interaction.reply({ content: 'Role được phép: ' + current.map((id) => `<@&${id}>`).join(', '), flags: MessageFlags.Ephemeral }).catch(() => {});
         }
+        return;
+      }
+      // Chỉ admin/Manage Server mới được add/remove
+      if (!isManager(interaction.member)) {
+        await interaction.reply({ content: 'Chỉ quản trị viên mới được thay đổi danh sách role.', flags: MessageFlags.Ephemeral }).catch(() => {});
         return;
       }
       const role = interaction.options.getRole('role');
