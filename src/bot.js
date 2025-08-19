@@ -45,6 +45,10 @@ const ttsClient = createTtsClient();
 
 const TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.DISCORD_CLIENT_ID;
+const DEFAULT_TTS_RATE = Number.isFinite(Number(process.env.DEFAULT_TTS_RATE))
+  ? Number(process.env.DEFAULT_TTS_RATE)
+  : undefined;
+const SILENT_MODE = (process.env.SILENT_MODE || 'ack').toLowerCase(); // 'ack' | 'delete'
 
 if (!TOKEN || !CLIENT_ID) {
   console.error('Missing DISCORD_TOKEN or DISCORD_CLIENT_ID in .env');
@@ -132,6 +136,19 @@ const ttsCommand = new SlashCommandBuilder()
       .setDescription('Tên voice cụ thể, ví dụ: vi-VN-Wavenet-A')
       .setRequired(false)
   );
+  
+// Add gender option for TTS selection when no specific voice is provided
+ttsCommand.addStringOption((opt) =>
+  opt
+    .setName('gender')
+    .setDescription('Giới tính giọng đọc (nếu không chọn voice cụ thể)')
+    .addChoices(
+      { name: 'Nam', value: 'male' },
+      { name: 'Nữ', value: 'female' },
+      { name: 'Trung tính', value: 'neutral' }
+    )
+    .setRequired(false)
+);
 
 const joinCommand = new SlashCommandBuilder()
   .setName('join')
@@ -247,7 +264,21 @@ function splitTextToSegments(text, maxLength = 4500) {
   return chunks;
 }
 
-async function synthesizeBuffers({ text, languageCode, voiceName, speakingRate, pitch }) {
+function mapGenderToSsml(gender) {
+  if (!gender) return undefined;
+  switch (gender) {
+    case 'male':
+      return 'MALE';
+    case 'female':
+      return 'FEMALE';
+    case 'neutral':
+      return 'NEUTRAL';
+    default:
+      return undefined;
+  }
+}
+
+async function synthesizeBuffers({ text, languageCode, voiceName, speakingRate, pitch, gender }) {
   const segments = splitTextToSegments(text);
   const buffers = [];
   for (const segment of segments) {
@@ -256,6 +287,7 @@ async function synthesizeBuffers({ text, languageCode, voiceName, speakingRate, 
       voice: {
         languageCode: languageCode || 'vi-VN',
         name: voiceName || undefined,
+        ssmlGender: voiceName ? undefined : mapGenderToSsml(gender),
       },
       audioConfig: {
         audioEncoding: 'MP3',
@@ -272,18 +304,81 @@ async function synthesizeBuffers({ text, languageCode, voiceName, speakingRate, 
   return buffers;
 }
 
+async function createResponder(interaction, initialContent) {
+  try {
+    await interaction.reply({ content: initialContent, flags: MessageFlags.Ephemeral });
+    return {
+      type: 'interaction',
+      update: async (content) => {
+        try {
+          await interaction.editReply(content);
+        } catch (e) {
+          console.warn('editReply failed:', e?.message || e);
+          await interaction.channel?.send(content).catch(() => {});
+        }
+      },
+    };
+  } catch (e) {
+    console.warn('initial reply failed:', e?.message || e);
+    const msg = await interaction.channel?.send(initialContent).catch(() => null);
+    return {
+      type: 'channel',
+      update: async (content) => {
+        try {
+          if (msg && msg.edit) {
+            await msg.edit(content);
+          } else {
+            await interaction.channel?.send(content).catch(() => {});
+          }
+        } catch (err) {
+          console.warn('channel message update failed:', err?.message || err);
+        }
+      },
+    };
+  }
+}
+
+async function ackSilent(interaction, text = 'Đang xử lý...') {
+  // Nếu đã được acknowledge, bỏ qua một cách im lặng
+  if (interaction.deferred || interaction.replied) {
+    return { async clear() {} };
+  }
+  try {
+    await interaction.reply({ content: text, flags: MessageFlags.Ephemeral });
+  } catch (_) {
+    // Bỏ qua mọi lỗi để không log gây nhiễu
+    return { async clear() {} };
+  }
+  let cleared = false;
+  return {
+    async clear() {
+      if (cleared) return;
+      cleared = true;
+      if (SILENT_MODE === 'delete') {
+        // Chờ ngắn để client xử lý acknowledge tránh hiển thị lỗi
+        await new Promise((r) => setTimeout(r, 1200));
+        await interaction.deleteReply().catch(() => {});
+      }
+    },
+  };
+}
+
 async function speakTextInChannel(voiceChannel, text, lang = 'vi-VN', opts = {}) {
   const { player } = await ensureConnectionAndPlayer(voiceChannel);
 
-  const speakingRate = typeof opts.rate === 'number' ? opts.rate : (opts.slow === 1 ? 0.85 : undefined);
+  const speakingRate = typeof opts.rate === 'number'
+    ? opts.rate
+    : (DEFAULT_TTS_RATE ?? (opts.slow === 1 ? 0.85 : undefined));
   const pitch = typeof opts.pitch === 'number' ? opts.pitch : undefined;
   const voiceName = opts.voice || undefined;
+  const gender = opts.gender || undefined;
   const audioBuffers = await synthesizeBuffers({
     text,
     languageCode: lang,
     voiceName,
     speakingRate,
     pitch,
+    gender,
   });
 
   // Queue chunks sequentially
@@ -324,28 +419,26 @@ client.on(Events.InteractionCreate, async (interaction) => {
     const voiceChannel = interaction.member?.voice?.channel;
 
     if (interaction.commandName === 'join') {
-      if (!voiceChannel) {
-        await interaction.reply({ content: 'Bạn cần vào một voice channel trước.', flags: MessageFlags.Ephemeral }).catch(() => {});
-        return;
+      const ack = await ackSilent(interaction, 'Đang vào kênh...');
+      if (voiceChannel) {
+        await ensureConnectionAndPlayer(voiceChannel);
       }
-      await ensureConnectionAndPlayer(voiceChannel);
-      await interaction.reply({ content: `Đã vào kênh thoại: ${voiceChannel.name}`, flags: MessageFlags.Ephemeral }).catch(() => {});
+      await ack.clear();
       return;
     }
 
     if (interaction.commandName === 'leave') {
+      const ack = await ackSilent(interaction, 'Đang rời kênh...');
       const guildId = interaction.guildId;
       const connection = guildIdToConnection.get(guildId);
       const player = guildIdToPlayer.get(guildId);
-      if (!connection) {
-        await interaction.reply({ content: 'Bot chưa ở kênh thoại nào.', flags: MessageFlags.Ephemeral }).catch(() => {});
-        return;
+      if (connection) {
+        try { player?.stop(true); } catch {}
+        try { connection.destroy(); } catch {}
+        guildIdToConnection.delete(guildId);
+        guildIdToPlayer.delete(guildId);
       }
-      try { player?.stop(true); } catch {}
-      try { connection.destroy(); } catch {}
-      guildIdToConnection.delete(guildId);
-      guildIdToPlayer.delete(guildId);
-      await interaction.reply({ content: 'Đã rời kênh thoại.', flags: MessageFlags.Ephemeral }).catch(() => {});
+      await ack.clear();
       return;
     }
 
@@ -384,28 +477,18 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
 
-    // tts (defer vì synthesize có thể lâu)
-    if (!voiceChannel) {
-      await interaction.reply({ content: 'Bạn cần vào một voice channel trước.', flags: MessageFlags.Ephemeral }).catch(() => {});
-      return;
-    }
-    try {
-      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-    } catch (e) {
-      console.warn('deferReply failed:', e?.message || e);
-      // tiếp tục thử trả lời nếu có thể
-    }
+    // tts: ack nhanh rồi xóa
+    const ack = await ackSilent(interaction, 'Đang đọc...');
+    if (!voiceChannel) { await ack.clear(); return; }
     const text = interaction.options.getString('text', true);
     const lang = interaction.options.getString('lang') || 'vi-VN';
     const rate = interaction.options.getNumber('rate');
     const pitch = interaction.options.getNumber('pitch');
     const voice = interaction.options.getString('voice');
-    await speakTextInChannel(voiceChannel, text, lang, { rate, pitch, voice });
-    if (interaction.deferred || interaction.replied) {
-      await interaction.editReply('Đã đọc xong.').catch(() => {});
-    } else {
-      await interaction.reply({ content: 'Đã đọc xong.', flags: MessageFlags.Ephemeral }).catch(() => {});
-    }
+    const gender = interaction.options.getString('gender');
+    await speakTextInChannel(voiceChannel, text, lang, { rate, pitch, voice, gender });
+    await ack.clear();
+    return;
   } catch (error) {
     console.error(error);
     if (interaction.isRepliable()) {
