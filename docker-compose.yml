@@ -1,0 +1,16 @@
+version: "3.9"
+
+services:
+  discord-tts-bot:
+    build: .
+    image: discord-tts-bot:latest
+    container_name: discord-tts-bot
+    restart: unless-stopped
+    env_file: .env
+    # Mount configs so GOOGLE_APPLICATION_CREDENTIALS path works and roles file persists
+    volumes:
+      - ./configs:/app/configs:ro
+    # If you use GOOGLE_APPLICATION_CREDENTIALS pointing to ./configs/xxx.json in .env,
+    # that path will be valid inside the container as /app/configs/xxx.json
+
+
