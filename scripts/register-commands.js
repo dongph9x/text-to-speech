@@ -22,19 +22,75 @@ const ttsCommand = new SlashCommandBuilder()
   .addStringOption((opt) =>
     opt
       .setName('lang')
-      .setDescription('Mã ngôn ngữ, ví dụ: vi, en, ja, ko ...')
+      .setDescription('Mã ngôn ngữ (ví dụ: vi-VN, en-US ...)')
       .setRequired(false)
   )
   .addNumberOption((opt) =>
     opt
-      .setName('slow')
-      .setDescription('Đọc chậm (1 là chậm, 0 là bình thường)')
+      .setName('rate')
+      .setDescription('Tốc độ đọc (0.25 - 4.0)')
       .setRequired(false)
+  )
+  .addNumberOption((opt) =>
+    opt
+      .setName('pitch')
+      .setDescription('Độ cao giọng (-20.0 đến 20.0)')
+      .setRequired(false)
+  )
+  .addStringOption((opt) =>
+    opt
+      .setName('voice')
+      .setDescription('Tên voice cụ thể, ví dụ: vi-VN-Wavenet-A')
+      .setRequired(false)
+  );
+
+const joinCommand = new SlashCommandBuilder()
+  .setName('join')
+  .setDescription('Bot tham gia voice channel của bạn');
+
+const leaveCommand = new SlashCommandBuilder()
+  .setName('leave')
+  .setDescription('Bot rời voice channel');
+
+const rolesCommand = new SlashCommandBuilder()
+  .setName('tts-roles')
+  .setDescription('Quản lý role được phép dùng TTS')
+  .addSubcommand((sub) =>
+    sub
+      .setName('add')
+      .setDescription('Thêm role được phép')
+      .addRoleOption((opt) =>
+        opt
+          .setName('role')
+          .setDescription('Role cần thêm')
+          .setRequired(true)
+      )
+  )
+  .addSubcommand((sub) =>
+    sub
+      .setName('remove')
+      .setDescription('Xóa role khỏi danh sách cho phép')
+      .addRoleOption((opt) =>
+        opt
+          .setName('role')
+          .setDescription('Role cần xóa')
+          .setRequired(true)
+      )
+  )
+  .addSubcommand((sub) =>
+    sub
+      .setName('list')
+      .setDescription('Xem danh sách role được phép')
   );
 
 async function main() {
   const rest = new REST({ version: '10' }).setToken(TOKEN);
-  const body = [ttsCommand.toJSON()];
+  const body = [
+    ttsCommand.toJSON(),
+    joinCommand.toJSON(),
+    leaveCommand.toJSON(),
+    rolesCommand.toJSON(),
+  ];
   if (GUILD_ID) {
     await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body });
     console.log('Registered commands to guild', GUILD_ID);

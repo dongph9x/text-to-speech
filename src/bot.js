@@ -1,5 +1,7 @@
 import 'dotenv/config';
-import { Client, GatewayIntentBits, Partials, Events, SlashCommandBuilder, REST, Routes, MessageFlags } from 'discord.js';
+import { Client, GatewayIntentBits, Partials, Events, SlashCommandBuilder, REST, Routes, PermissionsBitField } from 'discord.js';
+import { promises as fs } from 'node:fs';
+import path from 'node:path';
 import {
   joinVoiceChannel,
   createAudioPlayer,
@@ -59,6 +61,44 @@ const client = new Client({
   partials: [Partials.Channel],
 });
 
+// -------- Permissions (allowed roles) --------
+const ALLOWED_ROLES_FILE = process.env.ALLOWED_ROLES_FILE || path.resolve(process.cwd(), 'configs/allowed_roles.json');
+
+async function loadAllowedRoleIds() {
+  try {
+    const data = await fs.readFile(ALLOWED_ROLES_FILE, 'utf8');
+    const json = JSON.parse(data);
+    if (Array.isArray(json)) return json.map(String);
+    if (Array.isArray(json.roleIds)) return json.roleIds.map(String);
+    return [];
+  } catch {
+    return [];
+  }
+}
+
+async function isMemberAllowed(member) {
+  const allowed = await loadAllowedRoleIds();
+  if (!allowed.length) return true; // No file or empty -> allow everyone
+  const has = member?.roles?.cache?.some((role) => allowed.includes(role.id));
+  return Boolean(has);
+}
+
+async function saveAllowedRoleIds(roleIds) {
+  const dir = path.dirname(ALLOWED_ROLES_FILE);
+  await fs.mkdir(dir, { recursive: true });
+  const payload = { roleIds: Array.from(new Set(roleIds.map(String))) };
+  await fs.writeFile(ALLOWED_ROLES_FILE, JSON.stringify(payload, null, 2), 'utf8');
+}
+
+function isManager(member) {
+  const perms = member?.permissions;
+  if (!perms) return false;
+  return (
+    perms.has(PermissionsBitField.Flags.ManageGuild) ||
+    perms.has(PermissionsBitField.Flags.Administrator)
+  );
+}
+
 const ttsCommand = new SlashCommandBuilder()
   .setName('tts')
   .setDescription('Bot đọc văn bản (Text To Speech) trong voice channel')
@@ -101,8 +141,39 @@ const leaveCommand = new SlashCommandBuilder()
   .setName('leave')
   .setDescription('Bot rời voice channel');
 
+const rolesCommand = new SlashCommandBuilder()
+  .setName('tts-roles')
+  .setDescription('Quản lý role được phép dùng TTS')
+  .addSubcommand((sub) =>
+    sub
+      .setName('add')
+      .setDescription('Thêm role được phép')
+      .addRoleOption((opt) =>
+        opt
+          .setName('role')
+          .setDescription('Role cần thêm')
+          .setRequired(true)
+      )
+  )
+  .addSubcommand((sub) =>
+    sub
+      .setName('remove')
+      .setDescription('Xóa role khỏi danh sách cho phép')
+      .addRoleOption((opt) =>
+        opt
+          .setName('role')
+          .setDescription('Role cần xóa')
+          .setRequired(true)
+      )
+  )
+  .addSubcommand((sub) =>
+    sub
+      .setName('list')
+      .setDescription('Xem danh sách role được phép')
+  );
+
 async function registerCommands(guildId) {
-  const body = [ttsCommand.toJSON(), joinCommand.toJSON(), leaveCommand.toJSON()];
+  const body = [ttsCommand.toJSON(), joinCommand.toJSON(), leaveCommand.toJSON(), rolesCommand.toJSON()];
   const rest = new REST({ version: '10' }).setToken(TOKEN);
   if (guildId) {
     await rest.put(Routes.applicationGuildCommands(CLIENT_ID, guildId), { body });
@@ -230,7 +301,9 @@ async function speakTextInChannel(voiceChannel, text, lang = 'vi-VN', opts = {})
 client.once(Events.ClientReady, async () => {
   console.log(`Logged in as ${client.user.tag}`);
   try {
-    await registerCommands();
+    if (process.env.REGISTER_COMMANDS_ON_STARTUP === 'true') {
+      await registerCommands(process.env.GUILD_ID);
+    }
   } catch (e) {
     console.error('Register commands failed:', e);
   }
@@ -239,42 +312,106 @@ client.once(Events.ClientReady, async () => {
 client.on(Events.InteractionCreate, async (interaction) => {
   try {
     if (!interaction.isChatInputCommand()) return;
-    if (!['tts', 'join', 'leave'].includes(interaction.commandName)) return;
+    if (!['tts', 'join', 'leave', 'tts-roles'].includes(interaction.commandName)) return;
 
-    // defer sớm để tránh hết hạn interaction ( >3s )
-    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    const safeDefer = async () => {
+      try {
+        if (!interaction.deferred && !interaction.replied) {
+          await interaction.deferReply({ ephemeral: true });
+        }
+      } catch (e) {
+        console.warn('deferReply failed:', e?.message || e);
+      }
+    };
+    const safeRespond = async (content) => {
+      try {
+        if (interaction.deferred || interaction.replied) {
+          await interaction.editReply(content);
+        } else {
+          await interaction.reply({ content, ephemeral: true });
+        }
+      } catch (e) {
+        console.warn('respond failed:', e?.message || e);
+      }
+    };
+
+    // Permission check theo role
+    const allowed = await isMemberAllowed(interaction.member);
+    if (!allowed) {
+      await safeRespond('Bạn không có quyền dùng lệnh này.');
+      return;
+    }
 
     // Dùng cache để lấy voice channel, tránh gọi API chậm
     const voiceChannel = interaction.member?.voice?.channel;
     if (interaction.commandName === 'join') {
+      await safeDefer();
       if (!voiceChannel) {
-        await interaction.editReply('Bạn cần vào một voice channel trước.');
+        await safeRespond('Bạn cần vào một voice channel trước.');
         return;
       }
       await ensureConnectionAndPlayer(voiceChannel);
-      await interaction.editReply(`Đã vào kênh thoại: ${voiceChannel.name}`);
+      await safeRespond(`Đã vào kênh thoại: ${voiceChannel.name}`);
       return;
     }
 
     if (interaction.commandName === 'leave') {
+      await safeDefer();
       const guildId = interaction.guildId;
       const connection = guildIdToConnection.get(guildId);
       const player = guildIdToPlayer.get(guildId);
       if (!connection) {
-        await interaction.editReply('Bot chưa ở kênh thoại nào.');
+        await safeRespond('Bot chưa ở kênh thoại nào.');
         return;
       }
       try { player?.stop(true); } catch {}
       try { connection.destroy(); } catch {}
       guildIdToConnection.delete(guildId);
       guildIdToPlayer.delete(guildId);
-      await interaction.editReply('Đã rời kênh thoại.');
+      await safeRespond('Đã rời kênh thoại.');
       return;
     }
 
+    // tts-roles management (admin only)
+    if (interaction.commandName === 'tts-roles') {
+      await safeDefer();
+      if (!isManager(interaction.member)) {
+        await safeRespond('Bạn cần quyền Quản lý server để dùng lệnh này.');
+        return;
+      }
+      const sub = interaction.options.getSubcommand();
+      const current = await loadAllowedRoleIds();
+      if (sub === 'list') {
+        if (!current.length) {
+          await safeRespond('Danh sách role được phép đang trống (mọi người đều được phép).');
+        } else {
+          await safeRespond('Role được phép: ' + current.map((id) => `<@&${id}>`).join(', '));
+        }
+        return;
+      }
+      const role = interaction.options.getRole('role');
+      if (!role) {
+        await safeRespond('Không tìm thấy role.');
+        return;
+      }
+      if (sub === 'add') {
+        const next = Array.from(new Set([...current, role.id]));
+        await saveAllowedRoleIds(next);
+        await safeRespond(`Đã thêm role: <@&${role.id}>`);
+        return;
+      }
+      if (sub === 'remove') {
+        const next = current.filter((id) => id !== role.id);
+        await saveAllowedRoleIds(next);
+        await safeRespond(`Đã xóa role: <@&${role.id}>`);
+        return;
+      }
+    }
+
     // tts
+    await safeDefer();
     if (!voiceChannel) {
-      await interaction.editReply('Bạn cần vào một voice channel trước.');
+      await safeRespond('Bạn cần vào một voice channel trước.');
       return;
     }
 
@@ -285,16 +422,18 @@ client.on(Events.InteractionCreate, async (interaction) => {
     const voice = interaction.options.getString('voice');
 
     await speakTextInChannel(voiceChannel, text, lang, { rate, pitch, voice });
-    await interaction.editReply('Đã đọc xong.');
+    await safeRespond('Đã đọc xong.');
   } catch (error) {
     console.error(error);
     if (interaction.isRepliable()) {
       const content = 'Có lỗi xảy ra khi đọc TTS.';
-      if (interaction.deferred || interaction.replied) {
-        await interaction.editReply(content).catch(() => {});
-      } else {
-        await interaction.reply({ content, flags: MessageFlags.Ephemeral }).catch(() => {});
-      }
+      try {
+        if (interaction.deferred || interaction.replied) {
+          await interaction.editReply(content);
+        } else {
+          await interaction.reply({ content, ephemeral: true });
+        }
+      } catch {}
     }
   }
 });
