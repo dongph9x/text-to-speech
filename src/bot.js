@@ -48,6 +48,12 @@ const CLIENT_ID = process.env.DISCORD_CLIENT_ID;
 const DEFAULT_TTS_RATE = Number.isFinite(Number(process.env.DEFAULT_TTS_RATE))
   ? Number(process.env.DEFAULT_TTS_RATE)
   : undefined;
+// Default gender for /tts when user does not provide one: 'male' | 'female' | 'neutral'
+const DEFAULT_TTS_GENDER = (process.env.DEFAULT_TTS_GENDER || '').trim();
+// Cache TTL for Google TTS voices list (ms)
+const VOICE_CACHE_TTL_MS = Number.isFinite(Number(process.env.VOICE_CACHE_TTL_MS))
+  ? Number(process.env.VOICE_CACHE_TTL_MS)
+  : 60 * 60 * 1000;
 const SILENT_MODE = (process.env.SILENT_MODE || 'ack').toLowerCase(); // 'ack' | 'delete'
 const CLEAR_DELAY_MS = Number.isFinite(Number(process.env.CLEAR_DELAY_MS))
   ? Number(process.env.CLEAR_DELAY_MS)
@@ -335,16 +341,83 @@ function mapGenderToSsml(gender) {
   }
 }
 
+function normalizeGender(value) {
+  if (!value || typeof value !== 'string') return undefined;
+  const v = value.trim().toLowerCase();
+  if ([
+    'male', 'm', 'nam', 'anh', 'boy', 'man'
+  ].includes(v)) return 'male';
+  if ([
+    'female', 'f', 'nu', 'nữ', 'chi', 'girl', 'woman'
+  ].includes(v)) return 'female';
+  if ([
+    'neutral', 'other', 'none', 'trung tinh', 'trung tính'
+  ].includes(v)) return 'neutral';
+  return undefined;
+}
+
+let _voicesCache = { expiresAt: 0, voices: [] };
+async function getAllVoicesCached() {
+  const now = Date.now();
+  if (_voicesCache.voices.length && _voicesCache.expiresAt > now) {
+    return _voicesCache.voices;
+  }
+  try {
+    const [result] = await ttsClient.listVoices({});
+    const voices = Array.isArray(result?.voices) ? result.voices : [];
+    _voicesCache = { voices, expiresAt: now + VOICE_CACHE_TTL_MS };
+    return voices;
+  } catch (e) {
+    console.warn('listVoices failed, proceeding without validation:', e?.message || e);
+    _voicesCache = { voices: [], expiresAt: now + 10_000 };
+    return [];
+  }
+}
+
+async function pickVoiceForRequest(languageCode, requestedVoiceName, gender) {
+  const voices = await getAllVoicesCached();
+  if (!Array.isArray(voices) || voices.length === 0) {
+    return { name: undefined, ssmlGender: mapGenderToSsml(gender) };
+  }
+  const lang = (languageCode || '').trim();
+  // Exact match by name (case-sensitive as returned by API)
+  if (requestedVoiceName) {
+    const exact = voices.find((v) => v?.name === requestedVoiceName);
+    if (exact && Array.isArray(exact.languageCodes) && exact.languageCodes.includes(lang)) {
+      return { name: exact.name, ssmlGender: undefined };
+    }
+    // If name exists but for different language, we will ignore and try to find a compatible voice below
+  }
+  // Filter by language
+  const byLang = voices.filter((v) => Array.isArray(v?.languageCodes) && v.languageCodes.includes(lang));
+  if (byLang.length === 0) {
+    // No voices for this language; let API decide with ssmlGender only
+    return { name: undefined, ssmlGender: mapGenderToSsml(gender) };
+  }
+  // Prefer matching gender if provided
+  const targetGender = mapGenderToSsml(gender);
+  if (targetGender) {
+    const byGender = byLang.find((v) => v?.ssmlGender === targetGender);
+    if (byGender) {
+      return { name: byGender.name, ssmlGender: undefined };
+    }
+  }
+  // Fallback to first available voice for language
+  return { name: byLang[0].name, ssmlGender: undefined };
+}
+
 async function synthesizeBuffers({ text, languageCode, voiceName, speakingRate, pitch, gender }) {
   const segments = splitTextToSegments(text);
   const buffers = [];
+  // Validate/select a voice before synthesis to avoid INVALID_ARGUMENT
+  const selection = await pickVoiceForRequest(languageCode || 'vi-VN', voiceName || undefined, gender || undefined);
   for (const segment of segments) {
     const [response] = await ttsClient.synthesizeSpeech({
       input: { text: segment },
       voice: {
         languageCode: languageCode || 'vi-VN',
-        name: voiceName || undefined,
-        ssmlGender: voiceName ? undefined : mapGenderToSsml(gender),
+        name: selection.name || undefined,
+        ssmlGender: selection.name ? undefined : selection.ssmlGender,
       },
       audioConfig: {
         audioEncoding: 'MP3',
@@ -621,7 +694,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
       // Chỉ admin/quản lý mới được phép chọn voice cụ thể
       voice = null;
     }
-    const gender = interaction.options.getString('gender');
+    const gender = normalizeGender(
+      interaction.options.getString('gender') || DEFAULT_TTS_GENDER
+    );
     await speakTextInChannel(voiceChannel, text, lang, { rate, pitch, voice, gender });
     await ack.clear();
     return;

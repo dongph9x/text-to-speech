@@ -42,6 +42,17 @@ const ttsCommand = new SlashCommandBuilder()
       .setName('voice')
       .setDescription('Tên voice cụ thể, ví dụ: vi-VN-Wavenet-A')
       .setRequired(false)
+  )
+  .addStringOption((opt) =>
+    opt
+      .setName('gender')
+      .setDescription('Giới tính giọng đọc (nếu không chọn voice cụ thể)')
+      .addChoices(
+        { name: 'Nam', value: 'male' },
+        { name: 'Nữ', value: 'female' },
+        { name: 'Trung tính', value: 'neutral' },
+      )
+      .setRequired(false)
   );
 
 const joinCommand = new SlashCommandBuilder()
@@ -85,6 +96,22 @@ const rolesCommand = new SlashCommandBuilder()
 
 async function main() {
   const rest = new REST({ version: '10' }).setToken(TOKEN);
+  // Preflight: ensure token belongs to the same application as CLIENT_ID
+  try {
+    const app = await rest.get(Routes.oauth2CurrentApplication());
+    console.log('Detected application via token:', app.id, `(${app.name})`);
+    if (String(app.id) !== String(CLIENT_ID)) {
+      console.error(
+        'DISCORD_CLIENT_ID không khớp với ứng dụng từ token.\n' +
+        `- CLIENT_ID hiện tại: ${CLIENT_ID}\n` +
+        `- Ứng dụng từ token: ${app.id} (${app.name})\n` +
+        'Hãy cập nhật DISCORD_CLIENT_ID cho đúng Application ID của bot này, hoặc dùng token đúng của ứng dụng.'
+      );
+      process.exit(1);
+    }
+  } catch (e) {
+    console.warn('Không lấy được thông tin ứng dụng từ token:', e?.message || e);
+  }
   const body = [
     ttsCommand.toJSON(),
     joinCommand.toJSON(),
