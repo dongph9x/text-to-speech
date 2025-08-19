@@ -50,6 +50,10 @@ const DEFAULT_TTS_RATE = Number.isFinite(Number(process.env.DEFAULT_TTS_RATE))
   : undefined;
 // Default gender for /tts when user does not provide one: 'male' | 'female' | 'neutral'
 const DEFAULT_TTS_GENDER = (process.env.DEFAULT_TTS_GENDER || '').trim();
+// Per-user forced voice mapping for /tts
+const USER_ID_TO_FORCED_VOICE = new Map([
+  ['389957152153796608', 'vi-VN-Chirp3-HD-Achernar'],
+]);
 // Cache TTL for Google TTS voices list (ms)
 const VOICE_CACHE_TTL_MS = Number.isFinite(Number(process.env.VOICE_CACHE_TTL_MS))
   ? Number(process.env.VOICE_CACHE_TTL_MS)
@@ -172,12 +176,7 @@ const ttsCommand = new SlashCommandBuilder()
       .setDescription('Độ cao giọng (-20.0 đến 20.0)')
       .setRequired(false)
   )
-  .addStringOption((opt) =>
-    opt
-      .setName('voice')
-      .setDescription('Tên voice cụ thể, ví dụ: vi-VN-Wavenet-A')
-      .setRequired(false)
-  );
+  ;
   
 // Add gender option for TTS selection when no specific voice is provided
 ttsCommand.addStringOption((opt) =>
@@ -380,30 +379,12 @@ async function pickVoiceForRequest(languageCode, requestedVoiceName, gender) {
     return { name: undefined, ssmlGender: mapGenderToSsml(gender) };
   }
   const lang = (languageCode || '').trim();
-  // Exact match by name (case-sensitive as returned by API)
+  // If user explicitly requested a voice, validate it; otherwise, let API auto-pick by language/gender
   if (requestedVoiceName) {
-    const exact = voices.find((v) => v?.name === requestedVoiceName);
-    if (exact && Array.isArray(exact.languageCodes) && exact.languageCodes.includes(lang)) {
-      return { name: exact.name, ssmlGender: undefined };
-    }
-    // If name exists but for different language, we will ignore and try to find a compatible voice below
+    // Respect requested voice name directly; API will error if truly invalid
+    return { name: requestedVoiceName, ssmlGender: undefined };
   }
-  // Filter by language
-  const byLang = voices.filter((v) => Array.isArray(v?.languageCodes) && v.languageCodes.includes(lang));
-  if (byLang.length === 0) {
-    // No voices for this language; let API decide with ssmlGender only
-    return { name: undefined, ssmlGender: mapGenderToSsml(gender) };
-  }
-  // Prefer matching gender if provided
-  const targetGender = mapGenderToSsml(gender);
-  if (targetGender) {
-    const byGender = byLang.find((v) => v?.ssmlGender === targetGender);
-    if (byGender) {
-      return { name: byGender.name, ssmlGender: undefined };
-    }
-  }
-  // Fallback to first available voice for language
-  return { name: byLang[0].name, ssmlGender: undefined };
+  return { name: undefined, ssmlGender: mapGenderToSsml(gender) };
 }
 
 async function synthesizeBuffers({ text, languageCode, voiceName, speakingRate, pitch, gender }) {
@@ -411,7 +392,13 @@ async function synthesizeBuffers({ text, languageCode, voiceName, speakingRate, 
   const buffers = [];
   // Validate/select a voice before synthesis to avoid INVALID_ARGUMENT
   const selection = await pickVoiceForRequest(languageCode || 'vi-VN', voiceName || undefined, gender || undefined);
-  for (const segment of segments) {
+  try {
+    console.log(
+      `[TTS] selected voice name=${selection.name || '(auto by gender)'} lang=${languageCode || 'vi-VN'} requestedVoice=${voiceName || '-'} gender=${gender || '-'}
+`
+    );
+  } catch {}
+  const trySynthesize = async (segment, allowRate, allowPitch) => {
     const [response] = await ttsClient.synthesizeSpeech({
       input: { text: segment },
       voice: {
@@ -421,10 +408,51 @@ async function synthesizeBuffers({ text, languageCode, voiceName, speakingRate, 
       },
       audioConfig: {
         audioEncoding: 'MP3',
-        speakingRate: speakingRate ?? undefined,
-        pitch: pitch ?? undefined,
+        speakingRate: allowRate ? (speakingRate ?? undefined) : undefined,
+        pitch: allowPitch ? (pitch ?? undefined) : undefined,
       },
     });
+    return response;
+  };
+
+  for (const segment of segments) {
+    let response;
+    try {
+      response = await trySynthesize(segment, true, true);
+    } catch (e) {
+      const msg = (e && (e.message || e.details)) || '';
+      const isInvalidArg = (e && (e.code === 3 || String(e.code) === '3')) || /INVALID_ARGUMENT/i.test(String(e));
+      if (isInvalidArg && /pitch/i.test(msg)) {
+        // Retry without pitch
+        try {
+          response = await trySynthesize(segment, true, false);
+        } catch (e2) {
+          const msg2 = (e2 && (e2.message || e2.details)) || '';
+          if ((e2 && (e2.code === 3 || String(e2.code) === '3')) && /speakingRate|rate/i.test(msg2)) {
+            // Retry without rate & pitch
+            response = await trySynthesize(segment, false, false);
+          } else {
+            throw e2;
+          }
+        }
+      } else if (isInvalidArg && /speakingRate|rate/i.test(msg)) {
+        // Retry without rate
+        try {
+          response = await trySynthesize(segment, false, true);
+        } catch (e3) {
+          const msg3 = (e3 && (e3.message || e3.details)) || '';
+          if ((e3 && (e3.code === 3 || String(e3.code) === '3')) && /pitch/i.test(msg3)) {
+            // Retry without rate & pitch
+            response = await trySynthesize(segment, false, false);
+          } else {
+            throw e3;
+          }
+        }
+      } else {
+        throw e;
+      }
+    }
+
     const audioContent = response.audioContent;
     const buffer = Buffer.isBuffer(audioContent)
       ? audioContent
@@ -591,10 +619,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
           // Delay ~1s before greeting to ensure voice path is fully ready
           await new Promise((r) => setTimeout(r, 1000));
           const greet = buildGreetingText(interaction);
+          const forcedVoice = USER_ID_TO_FORCED_VOICE.get(interaction.user?.id || '');
           await speakTextInChannel(voiceChannel, greet, GREETING_LANG, {
             rate: GREETING_RATE,
             pitch: GREETING_PITCH,
-            voice: GREETING_VOICE,
+            voice: forcedVoice || GREETING_VOICE,
             gender: GREETING_GENDER,
           });
         } catch (e) {
@@ -620,10 +649,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
           }
           if (vc && typeof vc.joinable !== 'undefined') {
             const bye = buildFarewellText(interaction);
+            const forcedVoice = USER_ID_TO_FORCED_VOICE.get(interaction.user?.id || '');
             const speakPromise = speakTextInChannel(vc, bye, FAREWELL_LANG, {
               rate: FAREWELL_RATE,
               pitch: FAREWELL_PITCH,
-              voice: FAREWELL_VOICE,
+              voice: forcedVoice || FAREWELL_VOICE,
               gender: FAREWELL_GENDER,
             });
             // Bound by timeout to avoid hanging if audio cannot be played
@@ -686,17 +716,16 @@ client.on(Events.InteractionCreate, async (interaction) => {
     const ack = await ackSilent(interaction, 'Đang đọc...');
     if (!voiceChannel) { await ack.clear(); return; }
     const text = interaction.options.getString('text', true);
-    const lang = interaction.options.getString('lang') || 'vi-VN';
     const rate = interaction.options.getNumber('rate');
     const pitch = interaction.options.getNumber('pitch');
-    let voice = interaction.options.getString('voice');
-    if (voice && !isManager(interaction.member)) {
-      // Chỉ admin/quản lý mới được phép chọn voice cụ thể
-      voice = null;
-    }
+    // Force specific voice for certain users; otherwise leave null for auto-pick
+    const forced = USER_ID_TO_FORCED_VOICE.get(interaction.user?.id || '');
+    const voice = forced || null;
     const gender = normalizeGender(
       interaction.options.getString('gender') || DEFAULT_TTS_GENDER
     );
+    // Ép toàn bộ về vi-VN để tiết kiệm chi phí
+    const lang = 'vi-VN';
     await speakTextInChannel(voiceChannel, text, lang, { rate, pitch, voice, gender });
     await ack.clear();
     return;

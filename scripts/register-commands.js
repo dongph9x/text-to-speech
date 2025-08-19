@@ -39,12 +39,6 @@ const ttsCommand = new SlashCommandBuilder()
   )
   .addStringOption((opt) =>
     opt
-      .setName('voice')
-      .setDescription('Tên voice cụ thể, ví dụ: vi-VN-Wavenet-A')
-      .setRequired(false)
-  )
-  .addStringOption((opt) =>
-    opt
       .setName('gender')
       .setDescription('Giới tính giọng đọc (nếu không chọn voice cụ thể)')
       .addChoices(
