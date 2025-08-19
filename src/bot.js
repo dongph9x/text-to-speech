@@ -478,9 +478,22 @@ client.on(Events.InteractionCreate, async (interaction) => {
         console.log(
           `[JOIN_CMD] user="${displayName}" userId=${interaction.user?.id} guild="${interaction.guild?.name}" guildId=${interaction.guildId} channel="${voiceChannel.name}" time=${new Date().toISOString()}`
         );
+        // If bot already connected elsewhere, cleanly leave first
+        try {
+          const existing = guildIdToConnection.get(interaction.guildId);
+          if (existing && existing.joinConfig?.channelId && existing.joinConfig.channelId !== voiceChannel.id) {
+            const player = guildIdToPlayer.get(interaction.guildId);
+            try { player?.stop(true); } catch {}
+            try { existing.destroy(); } catch {}
+            guildIdToConnection.delete(interaction.guildId);
+            guildIdToPlayer.delete(interaction.guildId);
+          }
+        } catch {}
         await ensureConnectionAndPlayer(voiceChannel);
         // Play greeting after join
         try {
+          // Delay ~1s before greeting to ensure voice path is fully ready
+          await new Promise((r) => setTimeout(r, 1000));
           const greet = buildGreetingText(interaction);
           await speakTextInChannel(voiceChannel, greet, GREETING_LANG, {
             rate: GREETING_RATE,

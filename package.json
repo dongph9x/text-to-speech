@@ -14,7 +14,7 @@
     "clear": "node scripts/clear-commands.js"
   },
   "dependencies": {
-    "@discordjs/voice": "^0.16.1",
+    "@discordjs/voice": "^0.18.0",
     "@google-cloud/text-to-speech": "^5.2.0",
     "discord.js": "^14.16.3",
     "dotenv": "^16.4.5",
