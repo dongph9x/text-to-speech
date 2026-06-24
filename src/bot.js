@@ -14,40 +14,69 @@ import {
   StreamType,
 } from '@discordjs/voice';
 import ffmpegPath from 'ffmpeg-static';
-import { TextToSpeechClient } from '@google-cloud/text-to-speech';
 import { PassThrough } from 'node:stream';
+import { GoogleAuth } from 'google-auth-library';
 
 // Ensure prism-media/@discordjs/voice can find ffmpeg
 if (ffmpegPath) {
   process.env.FFMPEG_PATH = ffmpegPath;
 }
 
-function createTtsClient() {
-  const inlineKeyJson = process.env.GOOGLE_TTS_KEY_JSON;
-  if (inlineKeyJson && inlineKeyJson.trim().length > 0) {
+// -------- Google Cloud TTS (REST v1beta1) --------
+// Gemini-TTS (model_name + prompt) chỉ phục vụ qua endpoint v1beta1 và đi qua Vertex AI,
+// nên BẮT BUỘC xác thực OAuth bằng service account (API key không có quyền IAM predict).
+// Ưu tiên service account; fallback API key (chỉ dùng được cho giọng thường: WaveNet/Neural2/Chirp3).
+const TTS_API_KEY = (process.env.GOOGLE_TTS_API_KEY || '').trim();
+const TTS_ENDPOINT = 'https://texttospeech.googleapis.com/v1beta1/text:synthesize';
+
+let googleAuth = null;
+const _saInline = (process.env.GOOGLE_TTS_KEY_JSON || '').trim();
+const _saFile = (process.env.GOOGLE_APPLICATION_CREDENTIALS || '').trim();
+if (_saInline || _saFile) {
+  const authOpts = { scopes: ['https://www.googleapis.com/auth/cloud-platform'] };
+  if (_saInline) {
     try {
-      const keyObj = JSON.parse(inlineKeyJson);
-      const credentials = {
-        client_email: keyObj.client_email,
-        private_key: keyObj.private_key,
-      };
-      const projectId = keyObj.project_id;
-      return new TextToSpeechClient({ credentials, projectId });
+      authOpts.credentials = JSON.parse(_saInline);
     } catch (e) {
-      console.error('GOOGLE_TTS_KEY_JSON không hợp lệ. Sử dụng ADC mặc định nếu có.', e);
+      console.error('GOOGLE_TTS_KEY_JSON không phải JSON hợp lệ:', e?.message || e);
+      process.exit(1);
     }
   }
-  // Fallback: GOOGLE_APPLICATION_CREDENTIALS (đường dẫn file) hoặc ADC khác
-  return new TextToSpeechClient();
+  // Nếu chỉ có GOOGLE_APPLICATION_CREDENTIALS, GoogleAuth tự đọc file theo đường dẫn đó.
+  googleAuth = new GoogleAuth(authOpts);
 }
 
-const ttsClient = createTtsClient();
+if (!googleAuth && !TTS_API_KEY) {
+  console.error('Thiếu xác thực: cần GOOGLE_TTS_KEY_JSON / GOOGLE_APPLICATION_CREDENTIALS (service account, cho Gemini-TTS) hoặc GOOGLE_TTS_API_KEY (giọng thường).');
+  process.exit(1);
+}
+
+// Trả về header Authorization Bearer nếu dùng service account, ngược lại null (dùng ?key=).
+async function getTtsAuthHeader() {
+  if (!googleAuth) return null;
+  const client = await googleAuth.getClient();
+  const { token } = await client.getAccessToken();
+  return token ? { Authorization: `Bearer ${token}` } : null;
+}
 
 const TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.DISCORD_CLIENT_ID;
 const DEFAULT_TTS_RATE = Number.isFinite(Number(process.env.DEFAULT_TTS_RATE))
   ? Number(process.env.DEFAULT_TTS_RATE)
   : undefined;
+
+// -------- TTS voice config --------
+// Mặc định dùng giọng Standard (rẻ nhất: $4/1M ký tự, 4M ký tự miễn phí/tháng) qua API key.
+// GEMINI_TTS_MODEL chỉ đặt khi dùng service account + Gemini-TTS; để trống = không gửi model_name.
+const TTS_MODEL = typeof process.env.GEMINI_TTS_MODEL === 'string' && process.env.GEMINI_TTS_MODEL.trim().length > 0
+  ? process.env.GEMINI_TTS_MODEL.trim()
+  : '';
+const DEFAULT_TTS_VOICE = typeof process.env.DEFAULT_TTS_VOICE === 'string' && process.env.DEFAULT_TTS_VOICE.trim().length > 0
+  ? process.env.DEFAULT_TTS_VOICE.trim()
+  : 'vi-VN-Standard-A';
+const DEFAULT_TTS_STYLE = typeof process.env.DEFAULT_TTS_STYLE === 'string' && process.env.DEFAULT_TTS_STYLE.trim().length > 0
+  ? process.env.DEFAULT_TTS_STYLE
+  : 'Read aloud in a warm, welcoming tone.';
 const SILENT_MODE = (process.env.SILENT_MODE || 'ack').toLowerCase(); // 'ack' | 'delete'
 const CLEAR_DELAY_MS = Number.isFinite(Number(process.env.CLEAR_DELAY_MS))
   ? Number(process.env.CLEAR_DELAY_MS)
@@ -57,7 +86,7 @@ const ACK_TEXT = typeof process.env.ACK_TEXT === 'string' ? process.env.ACK_TEXT
 // Greeting config for join
 const GREETING_TEXT = typeof process.env.GREETING_TEXT === 'string' && process.env.GREETING_TEXT.trim().length > 0
   ? process.env.GREETING_TEXT
-  : 'Xin Chào Sir Ani Agent Có mặt';
+  : 'Xin Chào Mọi Người ạ!';
 const GREETING_LANG = typeof process.env.GREETING_LANG === 'string' && process.env.GREETING_LANG.trim().length > 0
   ? process.env.GREETING_LANG
   : 'vi-VN';
@@ -68,6 +97,9 @@ const GREETING_VOICE = typeof process.env.GREETING_VOICE === 'string' && process
   : undefined;
 const GREETING_GENDER = typeof process.env.GREETING_GENDER === 'string' && process.env.GREETING_GENDER.trim().length > 0
   ? process.env.GREETING_GENDER
+  : undefined;
+const GREETING_STYLE = typeof process.env.GREETING_STYLE === 'string' && process.env.GREETING_STYLE.trim().length > 0
+  ? process.env.GREETING_STYLE
   : undefined;
 
 // Farewell config for leave
@@ -84,6 +116,9 @@ const FAREWELL_VOICE = typeof process.env.FAREWELL_VOICE === 'string' && process
   : undefined;
 const FAREWELL_GENDER = typeof process.env.FAREWELL_GENDER === 'string' && process.env.FAREWELL_GENDER.trim().length > 0
   ? process.env.FAREWELL_GENDER
+  : undefined;
+const FAREWELL_STYLE = typeof process.env.FAREWELL_STYLE === 'string' && process.env.FAREWELL_STYLE.trim().length > 0
+  ? process.env.FAREWELL_STYLE
   : undefined;
 
 if (!TOKEN || !CLIENT_ID) {
@@ -186,6 +221,14 @@ ttsCommand.addStringOption((opt) =>
     .setRequired(false)
 );
 
+// Add style (prompt) option for Gemini-TTS to control speaking style
+ttsCommand.addStringOption((opt) =>
+  opt
+    .setName('style')
+    .setDescription('Phong cách đọc cho Gemini-TTS, ví dụ: "đọc giọng vui vẻ, nhấn nhá"')
+    .setRequired(false)
+);
+
 const joinCommand = new SlashCommandBuilder()
   .setName('join')
   .setDescription('Bot tham gia voice channel của bạn');
@@ -251,13 +294,23 @@ async function ensureConnectionAndPlayer(voiceChannel) {
       adapterCreator: voiceChannel.guild.voiceAdapterCreator,
       selfDeaf: false,
     });
+    connection.on('stateChange', (o, n) => console.log(`[VOICE] connection ${o.status} -> ${n.status}`));
+    connection.on('error', (e) => console.error('[VOICE] connection error:', e?.message || e));
     guildIdToConnection.set(guildId, connection);
-    await entersState(connection, VoiceConnectionStatus.Ready, 15_000);
+    try {
+      await entersState(connection, VoiceConnectionStatus.Ready, 15_000);
+      console.log('[VOICE] connection READY');
+    } catch (e) {
+      console.error('[VOICE] không vào được READY trong 15s:', e?.message || e);
+      throw e;
+    }
   }
 
   let player = guildIdToPlayer.get(guildId);
   if (!player) {
     player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Play } });
+    player.on('stateChange', (o, n) => console.log(`[VOICE] player ${o.status} -> ${n.status}`));
+    player.on('error', (e) => console.error('[VOICE] player error:', e?.message || e));
     guildIdToPlayer.set(guildId, player);
   }
   connection.subscribe(player);
@@ -265,7 +318,11 @@ async function ensureConnectionAndPlayer(voiceChannel) {
   return { connection, player };
 }
 
-function splitTextToSegments(text, maxLength = 4500) {
+const byteLen = (s) => Buffer.byteLength(s, 'utf8');
+
+// maxBytes đo theo byte (UTF-8) vì giới hạn của API tính bằng byte, và tiếng Việt
+// có nhiều ký tự nhiều byte. Gemini-TTS: text tối đa 4000 bytes -> dùng 3800 cho biên an toàn.
+function splitTextToSegments(text, maxBytes = 3800) {
   const sentences = text
     .replace(/\s+/g, ' ')
     .split(/([\.!?\,\;\:])/)
@@ -281,18 +338,25 @@ function splitTextToSegments(text, maxLength = 4500) {
   const chunks = [];
   let current = '';
   for (const sentence of sentences) {
-    if ((current + ' ' + sentence).trim().length <= maxLength) {
-      current = (current + ' ' + sentence).trim();
+    const candidate = (current + ' ' + sentence).trim();
+    if (byteLen(candidate) <= maxBytes) {
+      current = candidate;
     } else {
       if (current) chunks.push(current);
-      if (sentence.length <= maxLength) {
+      if (byteLen(sentence) <= maxBytes) {
         current = sentence;
       } else {
-        // Hard split very long sentence
-        for (let i = 0; i < sentence.length; i += maxLength) {
-          chunks.push(sentence.slice(i, i + maxLength));
+        // Cắt cứng câu quá dài theo byte mà không phá vỡ ký tự nhiều byte
+        let buf = '';
+        for (const ch of sentence) {
+          if (byteLen(buf + ch) > maxBytes) {
+            if (buf) chunks.push(buf);
+            buf = ch;
+          } else {
+            buf += ch;
+          }
         }
-        current = '';
+        current = buf;
       }
     }
   }
@@ -314,28 +378,54 @@ function mapGenderToSsml(gender) {
   }
 }
 
-async function synthesizeBuffers({ text, languageCode, voiceName, speakingRate, pitch, gender }) {
-  const segments = splitTextToSegments(text);
+async function synthesizeBuffers({ text, languageCode, voiceName, speakingRate, pitch, gender, modelName, prompt }) {
+  const maxBytes = modelName ? 3800 : 4500;
+  const segments = splitTextToSegments(text, maxBytes);
   const buffers = [];
   for (const segment of segments) {
-    const [response] = await ttsClient.synthesizeSpeech({
-      input: { text: segment },
-      voice: {
-        languageCode: languageCode || 'vi-VN',
-        name: voiceName || undefined,
-        ssmlGender: voiceName ? undefined : mapGenderToSsml(gender),
-      },
-      audioConfig: {
-        audioEncoding: 'MP3',
-        speakingRate: speakingRate ?? undefined,
-        pitch: pitch ?? undefined,
-      },
+    const voice = {
+      languageCode: languageCode || 'vi-VN',
+      name: voiceName || undefined,
+    };
+    if (modelName) {
+      // Gemini-TTS: chọn model qua model_name (proto field 6), dùng voice theo tên (vd Leda)
+      voice.modelName = modelName;
+    } else if (!voiceName) {
+      // Legacy (WaveNet/Standard): chọn giọng theo giới tính khi không có voice cụ thể
+      voice.ssmlGender = mapGenderToSsml(gender);
+    }
+    const input = { text: segment };
+    if (modelName && prompt) {
+      // Style instruction — chỉ hỗ trợ với model promptable như Gemini-TTS
+      input.prompt = prompt;
+    }
+    const audioConfig = { audioEncoding: 'MP3' };
+    if (speakingRate != null) audioConfig.speakingRate = speakingRate;
+    if (pitch != null) audioConfig.pitch = pitch;
+
+    const headers = { 'Content-Type': 'application/json' };
+    const authHeader = await getTtsAuthHeader();
+    let url = TTS_ENDPOINT;
+    if (authHeader) {
+      Object.assign(headers, authHeader); // service account: OAuth Bearer
+    } else {
+      url += `?key=${encodeURIComponent(TTS_API_KEY)}`; // fallback: API key
+    }
+    const res = await fetch(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ input, voice, audioConfig }),
     });
-    const audioContent = response.audioContent;
-    const buffer = Buffer.isBuffer(audioContent)
-      ? audioContent
-      : Buffer.from(audioContent);
-    buffers.push(buffer);
+    if (!res.ok) {
+      const errText = await res.text().catch(() => '');
+      throw new Error(`TTS API ${res.status}: ${errText}`);
+    }
+    const json = await res.json();
+    if (!json.audioContent) {
+      throw new Error('TTS API không trả về audioContent');
+    }
+    // REST trả audioContent dạng base64
+    buffers.push(Buffer.from(json.audioContent, 'base64'));
   }
   return buffers;
 }
@@ -394,7 +484,8 @@ async function ackSilent(interaction, text = 'Đang xử lý...') {
       if (SILENT_MODE === 'delete') {
         // Chờ để client xử lý acknowledge, tránh hiển thị lỗi "This interaction failed"
         await new Promise((r) => setTimeout(r, CLEAR_DELAY_MS));
-        await interaction.deleteReply().catch(() => {});
+        await interaction.deleteReply().catch((e) => console.error('[ACK] deleteReply lỗi:', e?.message || e));
+        console.log('[ACK] đã gọi deleteReply (mode=delete)');
       }
     },
   };
@@ -423,7 +514,11 @@ async function speakTextInChannel(voiceChannel, text, lang = 'vi-VN', opts = {})
     ? opts.rate
     : (DEFAULT_TTS_RATE ?? (opts.slow === 1 ? 0.85 : undefined));
   const pitch = typeof opts.pitch === 'number' ? opts.pitch : undefined;
-  const voiceName = opts.voice || undefined;
+  const modelName = opts.model || TTS_MODEL; // mặc định Gemini-TTS cho tất cả
+  const voiceName = opts.voice || DEFAULT_TTS_VOICE;
+  const prompt = typeof opts.style === 'string' && opts.style.trim().length > 0
+    ? opts.style.trim()
+    : DEFAULT_TTS_STYLE;
   const gender = opts.gender || undefined;
   const audioBuffers = await synthesizeBuffers({
     text,
@@ -432,7 +527,11 @@ async function speakTextInChannel(voiceChannel, text, lang = 'vi-VN', opts = {})
     speakingRate,
     pitch,
     gender,
+    modelName,
+    prompt,
   });
+
+  console.log(`[TTS] synth OK: ${audioBuffers.length} đoạn, voice=${voiceName}, model=${modelName || '(none)'}`);
 
   // Queue chunks sequentially
   for (const audioBuffer of audioBuffers) {
@@ -441,7 +540,12 @@ async function speakTextInChannel(voiceChannel, text, lang = 'vi-VN', opts = {})
     const { stream: probed, type } = await demuxProbe(stream);
     const resource = createAudioResource(probed, { inputType: type ?? StreamType.Arbitrary });
     player.play(resource);
-    await entersState(player, AudioPlayerStatus.Playing, 5_000);
+    try {
+      await entersState(player, AudioPlayerStatus.Playing, 5_000);
+    } catch (e) {
+      console.error('[VOICE] player không vào Playing trong 5s:', e?.message || e);
+      throw e;
+    }
     await new Promise((resolve) => player.once(AudioPlayerStatus.Idle, resolve));
   }
 }
@@ -500,6 +604,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
             pitch: GREETING_PITCH,
             voice: GREETING_VOICE,
             gender: GREETING_GENDER,
+            style: GREETING_STYLE,
           });
         } catch (e) {
           console.warn('greeting failed:', e?.message || e);
@@ -526,6 +631,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
               pitch: FAREWELL_PITCH,
               voice: FAREWELL_VOICE,
               gender: FAREWELL_GENDER,
+              style: FAREWELL_STYLE,
             });
           }
         } catch (e) {
@@ -589,7 +695,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
       voice = null;
     }
     const gender = interaction.options.getString('gender');
-    await speakTextInChannel(voiceChannel, text, lang, { rate, pitch, voice, gender });
+    const style = interaction.options.getString('style');
+    await speakTextInChannel(voiceChannel, text, lang, { rate, pitch, voice, gender, style });
     await ack.clear();
     return;
   } catch (error) {

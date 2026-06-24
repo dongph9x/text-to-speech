@@ -40,7 +40,24 @@ const ttsCommand = new SlashCommandBuilder()
   .addStringOption((opt) =>
     opt
       .setName('voice')
-      .setDescription('Tên voice cụ thể, ví dụ: vi-VN-Wavenet-A')
+      .setDescription('Tên voice Gemini-TTS, ví dụ: Leda, Kore, Charon')
+      .setRequired(false)
+  )
+  .addStringOption((opt) =>
+    opt
+      .setName('gender')
+      .setDescription('Giới tính giọng đọc (chỉ áp dụng giọng legacy WaveNet/Standard)')
+      .addChoices(
+        { name: 'Nam', value: 'male' },
+        { name: 'Nữ', value: 'female' },
+        { name: 'Trung tính', value: 'neutral' }
+      )
+      .setRequired(false)
+  )
+  .addStringOption((opt) =>
+    opt
+      .setName('style')
+      .setDescription('Phong cách đọc cho Gemini-TTS, ví dụ: "đọc giọng vui vẻ, nhấn nhá"')
       .setRequired(false)
   );
 

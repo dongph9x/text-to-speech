@@ -19,7 +19,8 @@ cp .env.example .env
 - `DISCORD_TOKEN`: Bot token
 - `DISCORD_CLIENT_ID`: Application (client) ID
 - `GUILD_ID` (tùy chọn): ID server để đăng ký lệnh nhanh khi dev
- - Thiết lập Google Cloud TTS bằng một trong hai cách:
+ - Thiết lập Google Cloud TTS bằng một trong các cách (theo thứ tự ưu tiên):
+   - `GOOGLE_TTS_API_KEY` = API key tạo trên GCP (đơn giản nhất)
    - `GOOGLE_APPLICATION_CREDENTIALS` = đường dẫn tuyệt đối đến file service account JSON
    - hoặc `GOOGLE_TTS_KEY_JSON` = nội dung JSON key (một dòng)
 
@@ -39,10 +40,13 @@ npm start
 - Vào một voice channel
 - Gõ lệnh:
 ```
-/tts text:"Xin chào mọi người" lang:"vi-VN" rate:1 pitch:0 voice:"vi-VN-Wavenet-A"
+/tts text:"Xin chào mọi người" lang:"vi-VN" voice:"Leda" style:"đọc giọng vui vẻ, nhấn nhá"
 ```
-- `lang` mặc định `vi-VN`; có thể chọn voice cụ thể như `vi-VN-Wavenet-A`
+- Mặc định dùng **Gemini-TTS** (`gemini-2.5-flash-tts`), giọng `Leda`, ngôn ngữ `vi-VN`
+- `voice`: tên giọng Gemini-TTS (vd `Leda`, `Kore`, `Charon`, `Aoede`) — chỉ admin được chọn
+- `style`: prompt điều khiển phong cách đọc (điểm mạnh của Gemini-TTS)
 - `rate` (0.25-4.0), `pitch` (-20 đến 20) là tùy chọn
+- Cấu hình mặc định qua env: `GEMINI_TTS_MODEL`, `DEFAULT_TTS_VOICE`, `DEFAULT_TTS_STYLE`
 
 ### Ghi chú
 - Bot tự thoát sau khi đọc xong để giải phóng kết nối.
