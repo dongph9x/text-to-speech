@@ -21,8 +21,8 @@ COPY src ./src
 COPY scripts ./scripts
 COPY README.md ./
 
-# Optional: copy example configs (real configs mounted at runtime)
-COPY configs/allowed_roles.example.json ./configs/allowed_roles.example.json
+# Lưu ý: config thật (configs/allowed_roles.json) được mount lúc chạy qua volume trong
+# docker-compose.yml, không cần copy vào image. Thiếu file -> bot cho phép mọi người.
 
 # Start the bot
 CMD ["npm", "start"]
